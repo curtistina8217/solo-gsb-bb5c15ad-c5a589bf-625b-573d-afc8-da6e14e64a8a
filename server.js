@@ -5,6 +5,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const express = require('express');
 const { locate, CONTEXT_LEN } = require('./lib/match');
+const { computeOverlapGroups } = require('./lib/overlap');
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -55,6 +56,14 @@ function resetMigration(a) {
   a.candidates = [];
 }
 
+/**
+ * 返回给前端的文稿视图：附带按当前位置即时计算的重叠冲突组。
+ * 派生数据不写入磁盘，每次迁移、人工定位或任何位置变动后随响应重新计算。
+ */
+function docJson(doc) {
+  return { ...doc, overlapGroups: computeOverlapGroups(doc.annotations) };
+}
+
 function notFound(res) {
   res.status(404).json({ error: '文稿不存在' });
 }
@@ -86,14 +95,14 @@ app.post('/api/documents', (req, res) => {
     updatedAt: now,
   };
   saveDoc(doc);
-  res.status(201).json(doc);
+  res.status(201).json(docJson(doc));
 });
 
 // 文稿详情
 app.get('/api/documents/:id', (req, res) => {
   const doc = loadDoc(req.params.id);
   if (!doc) return notFound(res);
-  res.json(doc);
+  res.json(docJson(doc));
 });
 
 // 删除文稿
@@ -126,7 +135,7 @@ app.put('/api/documents/:id/old', (req, res) => {
     return true;
   });
   saveDoc(doc);
-  res.json({ doc, dropped });
+  res.json({ doc: docJson(doc), dropped });
 });
 
 // 添加批注（记录选中文本及其前后文，供迁移时消歧）
@@ -159,7 +168,7 @@ app.post('/api/documents/:id/annotations', (req, res) => {
   resetMigration(a);
   doc.annotations.push(a);
   saveDoc(doc);
-  res.status(201).json(doc);
+  res.status(201).json(docJson(doc));
 });
 
 // 删除批注
@@ -172,7 +181,7 @@ app.delete('/api/documents/:id/annotations/:aid', (req, res) => {
     return res.status(404).json({ error: '批注不存在' });
   }
   saveDoc(doc);
-  res.json(doc);
+  res.json(docJson(doc));
 });
 
 // 保存/替换新稿：所有批注的迁移结果作废，需重新迁移
@@ -186,7 +195,7 @@ app.put('/api/documents/:id/new', (req, res) => {
   doc.newText = newText;
   doc.annotations.forEach(resetMigration);
   saveDoc(doc);
-  res.json(doc);
+  res.json(docJson(doc));
 });
 
 // 执行迁移：对每条批注在新稿中重新定位
@@ -203,7 +212,7 @@ app.post('/api/documents/:id/migrate', (req, res) => {
     a.candidates = r.candidates;
   }
   saveDoc(doc);
-  res.json(doc);
+  res.json(docJson(doc));
 });
 
 // 人工指定批注在新稿中的位置（采用候选或框选后调用）
@@ -227,7 +236,7 @@ app.put('/api/documents/:id/annotations/:aid/position', (req, res) => {
   a.status = 'manual';
   a.reason = 'human';
   saveDoc(doc);
-  res.json(doc);
+  res.json(docJson(doc));
 });
 
 app.listen(PORT, () => {

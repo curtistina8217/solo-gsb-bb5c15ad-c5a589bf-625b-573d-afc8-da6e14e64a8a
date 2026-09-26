@@ -63,20 +63,40 @@ function selectionRange(container) {
   return end > start ? { start, end } : null;
 }
 
-/** 把文本渲染为带高亮的 HTML（marks: [{start, end, cls, aid}]） */
+/**
+ * 把文本渲染为带高亮的 HTML（marks: [{start, end, cls, aid}]）。
+ * 支持重叠：在所有区间边界处切分文本，被多条批注覆盖的片段使用 hl-overlap 样式，
+ * 并把全部批注 id 写入 data-aids，保证重叠范围内的每条批注都能被查看和选中，
+ * 不会像简单平铺那样跳过后续批注。
+ */
 function renderWithMarks(text, marks) {
-  const sorted = marks
+  const valid = marks
     .filter((m) => m.start != null && m.end != null && m.start < m.end)
     .sort((a, b) => a.start - b.start);
-  let html = '';
-  let pos = 0;
-  for (const m of sorted) {
-    if (m.start < pos) continue; // 跳过重叠
-    html += escapeHtml(text.slice(pos, m.start));
-    html += `<mark class="${m.cls}" data-aid="${m.aid}">${escapeHtml(text.slice(m.start, m.end))}</mark>`;
-    pos = m.end;
+  if (!valid.length) return escapeHtml(text);
+  const cuts = new Set([0, text.length]);
+  for (const m of valid) {
+    cuts.add(m.start);
+    cuts.add(m.end);
   }
-  return html + escapeHtml(text.slice(pos));
+  const pts = [...cuts].sort((a, b) => a - b);
+  let html = '';
+  for (let i = 0; i < pts.length - 1; i++) {
+    const s = pts[i];
+    const e = pts[i + 1];
+    if (s >= e) continue;
+    const seg = escapeHtml(text.slice(s, e));
+    const covering = valid.filter((m) => m.start <= s && m.end >= e);
+    if (!covering.length) {
+      html += seg;
+    } else if (covering.length === 1) {
+      html += `<mark class="${covering[0].cls}" data-aids="${covering[0].aid}">${seg}</mark>`;
+    } else {
+      const aids = covering.map((m) => m.aid).join(' ');
+      html += `<mark class="hl-overlap" data-aids="${aids}" title="${covering.length} 条批注在此重叠，点击查看全部">${seg}</mark>`;
+    }
+  }
+  return html;
 }
 
 // ---------- 文稿管理 ----------
@@ -172,8 +192,9 @@ function renderResults() {
   const doc = state.doc;
   if (!doc) return;
   const text = doc.newText || '';
+  hideOverlapPicker();
 
-  // 左栏：新稿 + 高亮
+  // 左栏：新稿 + 高亮（重叠段不跳过后续批注，点击可逐条查看）
   const marks = doc.annotations
     .filter((a) => a.newStart != null)
     .map((a) => ({
@@ -183,16 +204,17 @@ function renderResults() {
       aid: a.id,
     }));
   $('newView').innerHTML = renderWithMarks(text, marks);
-  $('newView').querySelectorAll('mark[data-aid]').forEach((el) => {
-    el.addEventListener('click', () => {
-      const card = $('resultList').querySelector(`[data-card="${el.dataset.aid}"]`);
-      if (card) {
-        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        card.classList.add('flash');
-        setTimeout(() => card.classList.remove('flash'), 1200);
-      }
+  $('newView').querySelectorAll('mark[data-aids]').forEach((el) => {
+    el.addEventListener('click', (ev) => {
+      const aids = el.dataset.aids.split(' ');
+      if (aids.length === 1) flashCard(aids[0]);
+      else showOverlapPicker(ev.clientX, ev.clientY, aids);
     });
   });
+
+  // 批注 → 所属重叠组 的索引，用于在卡片上标注
+  const groupOf = new Map();
+  (doc.overlapGroups || []).forEach((g) => g.members.forEach((m) => groupOf.set(m.id, g)));
 
   // 右栏：批注卡片
   $('resultList').innerHTML = doc.annotations
@@ -207,10 +229,15 @@ function renderResults() {
       const pos = a.newStart != null
         ? `<div class="hint">位置：${snippet(text, a.newStart, a.newEnd)}</div>`
         : '';
+      const g = groupOf.get(a.id);
+      const overlapBadge = g
+        ? `<span class="badge badge-overlap" title="与第 ${g.id} 组内其他批注范围重叠">⚠ 重叠组 ${g.id}</span>`
+        : '';
       return `
         <div class="result-card st-${a.status}" data-card="${a.id}">
           <div class="ops">
             <span class="badge badge-${a.status}">${STATUS_LABEL[a.status] || a.status}</span>
+            ${overlapBadge}
             <span class="hint">${REASON_LABEL[a.reason] || ''}</span>
           </div>
           <div class="quote">${escapeHtml(a.quote)}</div>
@@ -238,6 +265,126 @@ function renderResults() {
       await setPosition(btn.dataset.aid, Number(btn.dataset.start), Number(btn.dataset.end));
     });
   });
+
+  renderOverlapGroups();
+}
+
+// ---------- 重叠复核 ----------
+
+/** 滚动到指定批注卡片并闪烁提示 */
+function flashCard(aid) {
+  const card = $('resultList').querySelector(`[data-card="${aid}"]`);
+  if (!card) return;
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.add('flash');
+  setTimeout(() => card.classList.remove('flash'), 1200);
+}
+
+/** 重叠段被点击时弹出选择器，列出该处全部批注，逐条可选 */
+function showOverlapPicker(x, y, aids) {
+  hideOverlapPicker();
+  const doc = state.doc;
+  const menu = document.createElement('div');
+  menu.id = 'overlapPicker';
+  menu.className = 'overlap-picker';
+  menu.innerHTML =
+    `<div class="picker-title">此处有 ${aids.length} 条批注重叠，选择要查看的一条：</div>` +
+    aids
+      .map((aid) => {
+        const a = doc.annotations.find((x2) => x2.id === aid);
+        if (!a) return '';
+        return `
+          <button class="picker-item" data-pick="${aid}">
+            <span class="badge badge-${a.status}">${STATUS_LABEL[a.status] || a.status}</span>
+            <span class="picker-comment">${escapeHtml(a.comment)}</span>
+            <span class="picker-quote">${escapeHtml(a.quote)}</span>
+          </button>`;
+      })
+      .join('');
+  document.body.appendChild(menu);
+  // 防止超出视口
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 12))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 12))}px`;
+  menu.querySelectorAll('[data-pick]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      hideOverlapPicker();
+      flashCard(btn.dataset.pick);
+    });
+  });
+  // 点击选择器外部时关闭（延迟绑定，避开触发本次打开的点击）
+  setTimeout(() => document.addEventListener('click', onPickerOutsideClick), 0);
+}
+
+function onPickerOutsideClick(e) {
+  const p = $('overlapPicker');
+  if (p && !p.contains(e.target)) hideOverlapPicker();
+}
+
+function hideOverlapPicker() {
+  const p = $('overlapPicker');
+  if (p) p.remove();
+  document.removeEventListener('click', onPickerOutsideClick);
+}
+
+/** 渲染重叠复核面板：列出每个冲突组的全部批注及范围 */
+function renderOverlapGroups() {
+  const doc = state.doc;
+  const groups = (doc && doc.overlapGroups) || [];
+  const panel = $('overlapPanel');
+  if (!groups.length) {
+    panel.classList.add('hidden');
+    $('overlapList').innerHTML = '';
+    return;
+  }
+  const text = doc.newText || '';
+  panel.classList.remove('hidden');
+  $('overlapCount').textContent =
+    `共 ${groups.length} 组冲突；修改任一位置后自动重算，待处理/未迁移批注不参与分组`;
+  $('overlapList').innerHTML = groups
+    .map((g) => {
+      const members = g.members
+        .map((m) => `
+          <div class="group-member">
+            <span class="badge badge-${m.status}">${STATUS_LABEL[m.status] || m.status}</span>
+            <span class="range">[${m.newStart}, ${m.newEnd})</span>
+            <span class="quote">${escapeHtml(m.quote)}</span>
+            <span class="comment">${escapeHtml(m.comment)}</span>
+            <button class="ghost small" data-goto="${m.id}">查看卡片</button>
+          </div>`)
+        .join('');
+      return `
+        <div class="overlap-group">
+          <div class="group-head">
+            <b>第 ${g.id} 组</b>
+            <span class="badge badge-${g.type}">${g.type === 'identical' ? '完全相同' : '部分交叠'}</span>
+            <span class="hint">覆盖范围 [${g.start}, ${g.end})：${snippet(text, g.start, g.end)}</span>
+            <button class="ghost small" data-jump="${g.id}">跳转到新稿位置</button>
+          </div>
+          ${members}
+        </div>`;
+    })
+    .join('');
+  $('overlapList').querySelectorAll('[data-jump]').forEach((btn) => {
+    btn.addEventListener('click', () => jumpToGroup(Number(btn.dataset.jump)));
+  });
+  $('overlapList').querySelectorAll('[data-goto]').forEach((btn) => {
+    btn.addEventListener('click', () => flashCard(btn.dataset.goto));
+  });
+}
+
+/** 在左侧新稿中滚动到冲突组位置，并闪烁该组所有高亮片段 */
+function jumpToGroup(gid) {
+  const g = (state.doc.overlapGroups || []).find((x) => x.id === gid);
+  if (!g) return;
+  const ids = new Set(g.members.map((m) => m.id));
+  const segs = [...$('newView').querySelectorAll('mark[data-aids]')].filter((el) =>
+    el.dataset.aids.split(' ').some((id) => ids.has(id))
+  );
+  if (!segs.length) return;
+  segs[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+  segs.forEach((el) => el.classList.add('flash'));
+  setTimeout(() => segs.forEach((el) => el.classList.remove('flash')), 1200);
 }
 
 async function setPosition(aid, start, end) {
