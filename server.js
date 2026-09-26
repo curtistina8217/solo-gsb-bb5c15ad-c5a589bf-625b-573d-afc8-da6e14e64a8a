@@ -15,6 +15,8 @@ fs.mkdirSync(DOCS_DIR, { recursive: true });
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+// 共享无 DOM 依赖的核心逻辑（重叠分组），前后端使用同一份代码
+app.use('/lib', express.static(path.join(__dirname, 'lib')));
 
 // ---------- 存储（每份文稿一个 JSON 文件） ----------
 

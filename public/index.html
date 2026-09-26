@@ -64,11 +64,20 @@
           <span class="dot dot-matched"></span>已定位
           <span class="dot dot-manual"></span>人工指定
           <span class="dot dot-pending"></span>待处理（需人工确认，系统不会猜测挂载）
+          <span class="dot dot-conflict"></span>位置重叠（点击高亮可在多条批注间切换）
         </span>
       </h2>
       <div id="manualBanner" class="manual-banner hidden">
         正在为批注「<span id="manualQuote"></span>」手动定位：请在左侧新稿中框选对应文字。
         <button id="btnCancelManual" class="ghost">取消</button>
+      </div>
+      <div id="conflictBox" class="conflict-box hidden">
+        <div class="conflict-head">
+          <b>⚠️ 新稿批注重叠复核</b>
+          <span id="conflictCount" class="hint"></span>
+          <span class="hint">半开区间判定，端点相接不算重叠；待处理与未迁移批注不入组。修改任一位置后即时重算。</span>
+        </div>
+        <div id="conflictList"></div>
       </div>
       <div class="result-grid">
         <div id="newView" class="doc-view"></div>
@@ -77,7 +86,9 @@
     </section>
   </main>
 
+  <div id="markChooser" class="mark-chooser hidden"></div>
   <div id="toast" class="toast hidden"></div>
+  <script src="/lib/overlap.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

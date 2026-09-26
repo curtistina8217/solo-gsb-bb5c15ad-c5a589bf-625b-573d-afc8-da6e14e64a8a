@@ -5,6 +5,12 @@ const state = {
   doc: null, // 当前文稿
   pendingSel: null, // 旧稿中待添加批注的选区 {start, end}
   manualFor: null, // 正在手动定位的批注 id
+  groups: [], // 当前新稿的重叠冲突组（每次渲染即时重算）
+};
+const groupByAid = () => {
+  const map = new Map();
+  state.groups.forEach((g) => g.annotationIds.forEach((id) => map.set(id, g)));
+  return map;
 };
 
 // ---------- 工具 ----------
@@ -63,20 +69,47 @@ function selectionRange(container) {
   return end > start ? { start, end } : null;
 }
 
-/** 把文本渲染为带高亮的 HTML（marks: [{start, end, cls, aid}]） */
+/**
+ * 把文本渲染为带高亮的 HTML（marks: [{start, end, cls, aid, gtype}]）。
+ * 重叠区间按原子分段后渲染为嵌套 <mark>，保证每条批注在重叠范围内都能被
+ * 点击/选中，绝不跳过后续批注。同一起点时范围更大的在外层。
+ */
 function renderWithMarks(text, marks) {
-  const sorted = marks
-    .filter((m) => m.start != null && m.end != null && m.start < m.end)
-    .sort((a, b) => a.start - b.start);
-  let html = '';
-  let pos = 0;
-  for (const m of sorted) {
-    if (m.start < pos) continue; // 跳过重叠
-    html += escapeHtml(text.slice(pos, m.start));
-    html += `<mark class="${m.cls}" data-aid="${m.aid}">${escapeHtml(text.slice(m.start, m.end))}</mark>`;
-    pos = m.end;
+  const valid = marks
+    .filter((m) => m.start != null && m.end != null && m.start < m.end && m.end <= text.length)
+    .sort((a, b) => a.start - b.start || b.end - a.end);
+
+  // 全部边界构成原子分段，每段内「生效中的批注」集合不变
+  const bounds = new Set();
+  for (const m of valid) {
+    bounds.add(m.start);
+    bounds.add(m.end);
   }
-  return html + escapeHtml(text.slice(pos));
+  const points = [...bounds].sort((x, y) => x - y);
+  let html = '';
+  for (let i = 0; i < points.length - 1; i++) {
+    const segStart = points[i];
+    const segEnd = points[i + 1];
+    const active = valid.filter((m) => m.start <= segStart && m.end >= segEnd);
+    if (!active.length) {
+      html += escapeHtml(text.slice(segStart, segEnd));
+      continue;
+    }
+    // 起点越晚/终点越早的越在内层（内层最后包裹）
+    active.sort((a, b) => b.start - a.start || a.end - b.end);
+    let inner = escapeHtml(text.slice(segStart, segEnd));
+    for (const m of active) {
+      const conflict = m.gtype ? ` conflict conflict-${m.gtype}` : '';
+      inner =
+        `<mark class="${m.cls}${conflict}" data-aid="${m.aid}">${inner}</mark>`;
+    }
+    html += inner;
+  }
+  // 首尾边界之外的文本
+  const first = points[0];
+  const last = points[points.length - 1];
+  if (!points.length) return escapeHtml(text);
+  return escapeHtml(text.slice(0, first)) + html + escapeHtml(text.slice(last));
 }
 
 // ---------- 文稿管理 ----------
@@ -95,6 +128,7 @@ async function loadDoc(id) {
   state.doc = await api('GET', `/api/documents/${id}`);
   state.pendingSel = null;
   state.manualFor = null;
+  state.suppressMarkClick = false;
   $('emptyState').classList.add('hidden');
   $('workspace').classList.remove('hidden');
   $('annotForm').classList.add('hidden');
@@ -168,12 +202,21 @@ function snippet(text, start, end) {
   return `…${escapeHtml(before)}<b>【${escapeHtml(mid)}】</b>${escapeHtml(after)}…`;
 }
 
+function rangeText(start, end) {
+  return `[${start}, ${end}) · ${end - start} 字`;
+}
+
 function renderResults() {
   const doc = state.doc;
   if (!doc) return;
   const text = doc.newText || '';
+  $('markChooser').classList.add('hidden');
 
-  // 左栏：新稿 + 高亮
+  // 即时重算重叠冲突组（迁移 / 人工定位 / 重新渲染后都会走到这里）
+  state.groups = OverlapGroups.buildOverlapGroups(doc.annotations, text.length);
+  const aidGroup = groupByAid();
+
+  // 左栏：新稿 + 高亮（重叠区间嵌套渲染，每条批注均可点击）
   const marks = doc.annotations
     .filter((a) => a.newStart != null)
     .map((a) => ({
@@ -181,17 +224,11 @@ function renderResults() {
       end: a.newEnd,
       cls: a.status === 'manual' ? 'hl-manual' : a.status === 'matched' ? 'hl-matched' : 'hl-pending',
       aid: a.id,
+      gtype: aidGroup.has(a.id) ? aidGroup.get(a.id).type : null,
     }));
   $('newView').innerHTML = renderWithMarks(text, marks);
   $('newView').querySelectorAll('mark[data-aid]').forEach((el) => {
-    el.addEventListener('click', () => {
-      const card = $('resultList').querySelector(`[data-card="${el.dataset.aid}"]`);
-      if (card) {
-        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        card.classList.add('flash');
-        setTimeout(() => card.classList.remove('flash'), 1200);
-      }
-    });
+    el.addEventListener('click', (e) => onMarkClick(e, el));
   });
 
   // 右栏：批注卡片
@@ -205,13 +242,20 @@ function renderResults() {
           </button>`)
         .join('');
       const pos = a.newStart != null
-        ? `<div class="hint">位置：${snippet(text, a.newStart, a.newEnd)}</div>`
+        ? `<div class="hint">位置：${rangeText(a.newStart, a.newEnd)} ${snippet(text, a.newStart, a.newEnd)}</div>`
+        : '';
+      const g = aidGroup.get(a.id);
+      const conflictTag = g
+        ? `<span class="conflict-tag conflict-tag-${g.type}" data-jump-group="${state.groups.indexOf(g)}">
+             ${g.type === 'exact' ? '⚠ 范围完全相同' : '⚠ 部分交叠'}（${g.annotationIds.length} 条）
+           </span>`
         : '';
       return `
         <div class="result-card st-${a.status}" data-card="${a.id}">
           <div class="ops">
             <span class="badge badge-${a.status}">${STATUS_LABEL[a.status] || a.status}</span>
             <span class="hint">${REASON_LABEL[a.reason] || ''}</span>
+            ${conflictTag}
           </div>
           <div class="quote">${escapeHtml(a.quote)}</div>
           <div class="comment">${escapeHtml(a.comment)}</div>
@@ -219,6 +263,7 @@ function renderResults() {
           ${cands ? `<div class="hint">可选位置：</div>${cands}` : ''}
           <div class="ops">
             <button class="ghost small" data-manual="${a.id}">手动定位</button>
+            ${a.newStart != null ? `<button class="ghost small" data-jump="${a.id}">跳转到新稿位置</button>` : ''}
           </div>
         </div>`;
     })
@@ -238,6 +283,173 @@ function renderResults() {
       await setPosition(btn.dataset.aid, Number(btn.dataset.start), Number(btn.dataset.end));
     });
   });
+  $('resultList').querySelectorAll('[data-jump]').forEach((btn) => {
+    btn.addEventListener('click', () => jumpToAnnotation(btn.dataset.jump));
+  });
+  $('resultList').querySelectorAll('[data-jump-group]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const g = state.groups[Number(el.dataset.jumpGroup)];
+      if (g) jumpToRange(g.start, g.end);
+    });
+  });
+
+  renderConflicts(text);
+}
+
+/** 渲染重叠复核面板：列出每组的全部批注及对应范围 */
+function renderConflicts(text) {
+  const groups = state.groups;
+  const box = $('conflictBox');
+  if (!groups.length) {
+    box.classList.add('hidden');
+    return;
+  }
+  box.classList.remove('hidden');
+  const exactN = groups.filter((g) => g.type === 'exact').length;
+  const partialN = groups.length - exactN;
+  $('conflictCount').textContent =
+    `${groups.length} 组（完全相同 ${exactN}，部分交叠 ${partialN}）`;
+
+  $('conflictList').innerHTML = groups
+    .map((g, gi) => {
+      const members = g.members
+        .map((m) => {
+          const a = state.doc.annotations.find((x) => x.id === m.id);
+          if (!a) return '';
+          const sameAsGroup = m.start === g.start && m.end === g.end;
+          return `
+            <div class="conflict-member" data-pick="${m.id}">
+              <div class="ops">
+                <span class="badge badge-${m.status}">${STATUS_LABEL[m.status] || m.status}</span>
+                <span class="hint">${rangeText(m.start, m.end)}</span>
+                ${g.type === 'partial' && !sameAsGroup ? '<span class="hint">（组内较短范围）</span>' : ''}
+                <button class="ghost small" data-pick-jump="${m.id}">跳转到新稿位置</button>
+              </div>
+              <div class="quote">${escapeHtml(a.quote)}</div>
+              <div class="comment">${escapeHtml(a.comment)}</div>
+            </div>`;
+        })
+        .join('');
+      return `
+        <div class="conflict-card conflict-${g.type}" data-conflict-card="${gi}">
+          <div class="conflict-title">
+            <span class="conflict-badge conflict-badge-${g.type}">
+              ${g.type === 'exact' ? '完全相同' : '部分交叠'}
+            </span>
+            <b>第 ${gi + 1} 组 · ${g.annotationIds.length} 条批注</b>
+            <span class="hint">合并范围 ${rangeText(g.start, g.end)}</span>
+            <button class="ghost small" data-group-jump="${gi}">跳转到新稿位置</button>
+          </div>
+          <div class="conflict-preview hint">新稿内容：${snippet(text, g.start, g.end)}</div>
+          ${members}
+        </div>`;
+    })
+    .join('');
+
+  $('conflictList').querySelectorAll('[data-group-jump]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const g = state.groups[Number(btn.dataset.groupJump)];
+      if (g) jumpToRange(g.start, g.end);
+    });
+  });
+  $('conflictList').querySelectorAll('[data-pick-jump]').forEach((btn) => {
+    btn.addEventListener('click', () => jumpToAnnotation(btn.dataset.pickJump));
+  });
+  $('conflictList').querySelectorAll('.conflict-member').forEach((row) => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
+      focusCard(row.dataset.pick);
+    });
+  });
+}
+
+/** 点击新稿高亮：重叠处列出该处全部批注，点哪条选哪条，不跳过后续批注 */
+function onMarkClick(e, el) {
+  e.stopPropagation();
+  if (state.suppressMarkClick) {
+    state.suppressMarkClick = false;
+    return;
+  }
+  const aids = [];
+  let cur = el;
+  // 命中点上可能嵌套多个 mark，沿祖先链收集同一处的全部批注
+  while (cur && cur !== $('newView') && cur.nodeType === 1) {
+    if (cur.dataset && cur.dataset.aid) aids.push(cur.dataset.aid);
+    cur = cur.parentElement;
+  }
+  const unique = [...new Set(aids)];
+  if (unique.length === 1) {
+    selectAnnotation(unique[0]);
+    return;
+  }
+  const chooser = $('markChooser');
+  chooser.innerHTML =
+    `<div class="chooser-title">此处有 ${unique.length} 条重叠批注，请选择：</div>` +
+    unique
+      .map((id) => {
+        const a = state.doc.annotations.find((x) => x.id === id);
+        if (!a) return '';
+        const g = groupByAid().get(id);
+        return `
+          <button class="chooser-item" data-choose="${id}">
+            <span class="badge badge-${a.status}">${STATUS_LABEL[a.status] || a.status}</span>
+            ${g ? `<span class="conflict-tag conflict-tag-${g.type}">${g.type === 'exact' ? '完全相同' : '部分交叠'}</span>` : ''}
+            <span class="quote">${escapeHtml(a.comment || a.quote)}</span>
+            <span class="hint">${rangeText(a.newStart, a.newEnd)}</span>
+          </button>`;
+      })
+      .join('');
+  const rect = el.getBoundingClientRect();
+  chooser.style.left = `${Math.min(window.scrollX + rect.left, window.scrollX + window.innerWidth - 320)}px`;
+  chooser.style.top = `${window.scrollY + rect.bottom + 6}px`;
+  chooser.classList.remove('hidden');
+  chooser.querySelectorAll('[data-choose]').forEach((b) => {
+    b.addEventListener('click', () => {
+      chooser.classList.add('hidden');
+      selectAnnotation(b.dataset.choose);
+    });
+  });
+}
+
+/** 选中一条批注：高亮新稿对应位置（含被嵌套拆分的各段）并定位右侧卡片 */
+function selectAnnotation(aid) {
+  $('newView').querySelectorAll(`mark[data-aid="${CSS.escape(aid)}"]`).forEach((m) => flash(m));
+  focusCard(aid);
+}
+
+function focusCard(aid) {
+  const card = $('resultList').querySelector(`[data-card="${aid}"]`);
+  if (card) {
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    flash(card);
+  }
+}
+
+function flash(el) {
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1200);
+}
+
+/** 从右侧/冲突面板跳转到新稿位置 */
+function jumpToAnnotation(aid) {
+  const first = $('newView').querySelector(`mark[data-aid="${CSS.escape(aid)}"]`);
+  if (!first) return;
+  selectAnnotation(aid);
+  first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+/** 跳转到指定偏移区间（合并范围）：选覆盖该区间起点的最外层高亮 */
+function jumpToRange(start) {
+  const covering = [...$('newView').querySelectorAll('mark[data-aid]')].filter((el) => {
+    const a = state.doc.annotations.find((x) => x.id === el.dataset.aid);
+    return a && a.newStart <= start && a.newEnd > start;
+  });
+  // 文档顺序中最先出现的是嵌套最外层（其开标签最早）
+  const target = covering[0];
+  if (target) {
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    flash(target);
+  }
 }
 
 async function setPosition(aid, start, end) {
@@ -366,6 +578,11 @@ $('btnRemigrate').addEventListener('click', async () => {
 
 // 手动定位模式下，在新稿中框选文字即作为该批注的位置
 $('newView').addEventListener('mouseup', () => {
+  // 框选结束后的合成 click 不应触发批注选择弹层（同步置位，由 click 消费）
+  if (state.manualFor) {
+    const range = selectionRange($('newView'));
+    if (range) state.suppressMarkClick = true;
+  }
   setTimeout(async () => {
     if (!state.manualFor || !state.doc) return;
     const range = selectionRange($('newView'));
@@ -378,6 +595,14 @@ $('newView').addEventListener('mouseup', () => {
 $('btnCancelManual').addEventListener('click', () => {
   state.manualFor = null;
   $('manualBanner').classList.add('hidden');
+});
+
+// 点击高亮弹层之外 → 关闭选择弹层
+document.addEventListener('click', (e) => {
+  const chooser = $('markChooser');
+  if (chooser.classList.contains('hidden')) return;
+  if (e.target.closest('#markChooser') || e.target.closest('mark')) return;
+  chooser.classList.add('hidden');
 });
 
 // ---------- 启动 ----------
